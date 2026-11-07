@@ -20,7 +20,10 @@ fi
 cargo build --release
 
 install -Dm755 target/release/simplemusicplayer "$BIN"
-install -Dm644 packaging/simplemusicplayer.desktop "$APPS"
+# Absolute path: the Plasma session's PATH often lacks ~/.local/bin.
+mkdir -p "$(dirname "$APPS")"
+sed "s|^Exec=.*|Exec=$BIN|" packaging/simplemusicplayer.desktop > "$APPS"
+chmod 644 "$APPS"
 install -Dm644 assets/simplemusicplayer.svg "$ICONS/scalable/apps/simplemusicplayer.svg"
 if command -v rsvg-convert >/dev/null 2>&1; then
     for s in 16 24 32 48 64 128 256; do
