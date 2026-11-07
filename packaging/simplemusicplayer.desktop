@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Name=Simple Music Player
+GenericName=Music Player
+GenericName[de]=Musikspieler
+Comment=Simple folder-based music player
+Comment[de]=Einfacher ordnerbasierter Musikspieler
+Exec=simplemusicplayer
+Icon=simplemusicplayer
+Terminal=false
+Categories=AudioVideo;Audio;Player;
+Keywords=music;player;audio;mp3;flac;ogg;Musik;
+StartupWMClass=simplemusicplayer
+SingleMainWindow=true

@@ -1,0 +1,16 @@
+[package]
+name = "simplemusicplayer"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+dirs = "7"
+eframe = "0.37"
+lofty = "0.25"
+rfd = "0.17"
+rodio = { version = "0.23", features = ["symphonia-aiff"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+souvlaki = { version = "0.9", default-features = false, features = ["use_zbus"] }
+symphonia = { version = "0.5", default-features = false, features = ["ogg"] }
+symphonia-adapter-libopus = { version = "0.2.9", default-features = false }
