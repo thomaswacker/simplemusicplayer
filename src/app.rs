@@ -618,6 +618,8 @@ impl eframe::App for MusicApp {
         self.config.volume = snap.volume;
         self.config.muted = snap.muted;
         self.config.save();
+        // Saves the playback position for the next start.
+        self.player.shutdown();
     }
 }
 

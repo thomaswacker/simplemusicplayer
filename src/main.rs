@@ -7,6 +7,7 @@ mod library;
 mod media_keys;
 mod opus;
 mod player;
+mod resume;
 
 use eframe::egui;
 use std::path::PathBuf;

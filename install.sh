@@ -20,9 +20,12 @@ fi
 cargo build --release
 
 install -Dm755 target/release/simplemusicplayer "$BIN"
-# Absolute path: the Plasma session's PATH often lacks ~/.local/bin.
+# Absolute, quoted path: the Plasma session's PATH often lacks ~/.local/bin.
+case "$BIN" in
+    *[\"\`\$\\\|\&]*) echo "PREFIX darf keine Zeichen \" \` \$ \\ | & enthalten: $PREFIX" >&2; exit 1 ;;
+esac
 mkdir -p "$(dirname "$APPS")"
-sed "s|^Exec=.*|Exec=$BIN|" packaging/simplemusicplayer.desktop > "$APPS"
+sed "s|^Exec=.*|Exec=\"$BIN\"|" packaging/simplemusicplayer.desktop > "$APPS"
 chmod 644 "$APPS"
 install -Dm644 assets/simplemusicplayer.svg "$ICONS/scalable/apps/simplemusicplayer.svg"
 if command -v rsvg-convert >/dev/null 2>&1; then

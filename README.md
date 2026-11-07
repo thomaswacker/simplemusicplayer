@@ -5,6 +5,7 @@ Ein kleiner, ordnerbasierter Musikspieler für den Linux-Desktop (KDE Plasma), g
 - Startordner wählen, Unterordner durchblättern, Titel anklicken: der Ordner wird zur Wiedergabeliste
 - Play/Pause, vorheriger/nächster Titel, Spulen, Lautstärke, Stummschalten
 - Nach dem Ende eines Titels geht es automatisch mit dem nächsten weiter
+- Beim Beenden merkt er sich Titel und Stelle; beim nächsten Start steht der Titel pausiert dort bereit
 - Medientasten und das Plasma-Medienwidget funktionieren über MPRIS, auch wenn das Fenster minimiert ist
 - Formate: MP3, FLAC, Ogg Vorbis, Opus, M4A/AAC, WAV, AIFF
 
@@ -39,7 +40,7 @@ simplemusicplayer ~/Musik
 
 Die Lautstärketasten der Tastatur regeln in KDE die Systemlautstärke. Die Player-Lautstärke lässt sich im Fenster und im Plasma-Medienwidget einstellen.
 
-Die Einstellungen (Startordner, letzter Ordner, Lautstärke) liegen in `~/.config/simplemusicplayer/config.json`.
+Die Einstellungen (Startordner, letzter Ordner, Lautstärke) liegen in `~/.config/simplemusicplayer/config.json`, die Wiedergabeposition in `~/.local/state/simplemusicplayer/resume.json`.
 
 ## Entwicklung
 
@@ -47,7 +48,8 @@ Die Einstellungen (Startordner, letzter Ordner, Lautstärke) liegen in `~/.confi
 cargo run -- ~/Musik
 cargo test
 # Wiedergabe-Integrationstest (stumm, braucht ein Audiogerät):
-SMP_TEST_DIR=/pfad/zu/kurzen/titeln cargo test -- --ignored
+SMP_TEST_DIR=/pfad/zu/kurzen/titeln SMP_TEST_LONG_DIR=/pfad/zu/titeln/ab/5s \
+  cargo test -- --ignored --test-threads=1
 ```
 
 Aufbau:

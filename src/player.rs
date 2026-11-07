@@ -8,16 +8,19 @@
 use crate::library::display_stem;
 use crate::media_keys::MediaKeys;
 use crate::opus::OpusSource;
+use crate::resume::{self, ResumeState};
 use eframe::egui;
 use rodio::{Decoder, DeviceSinkBuilder, MixerDeviceSink, Player, Source};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// "Previous" restarts the current track if more than this has been played.
 const RESTART_THRESHOLD: Duration = Duration::from_secs(3);
+/// While playing, the position is saved this often (in case the app gets killed).
+const RESUME_SAVE_INTERVAL: Duration = Duration::from_secs(5);
 pub const VOLUME_STEP: f32 = 0.05;
 
 #[derive(Debug, Clone)]
@@ -115,12 +118,19 @@ impl PlayerHandle {
     }
 }
 
-impl Drop for PlayerHandle {
-    fn drop(&mut self) {
+impl PlayerHandle {
+    /// Stops playback and waits until the playback thread has saved its state.
+    pub fn shutdown(&mut self) {
         let _ = self.tx.send(Command::Shutdown);
         if let Some(t) = self.thread.take() {
             let _ = t.join();
         }
+    }
+}
+
+impl Drop for PlayerHandle {
+    fn drop(&mut self) {
+        self.shutdown();
     }
 }
 
@@ -148,6 +158,9 @@ struct Controller {
 
     media_keys: Option<MediaKeys>,
     last_published: Snapshot,
+    /// Last state written to disk, and when.
+    saved_resume: Option<ResumeState>,
+    last_resume_save: Instant,
 }
 
 impl Controller {
@@ -176,10 +189,13 @@ impl Controller {
             error: None,
             media_keys,
             last_published: Snapshot::default(),
+            saved_resume: None,
+            last_resume_save: Instant::now(),
         };
         if let Some(mk) = &mut c.media_keys {
             mk.set_volume(c.volume, c.muted);
         }
+        c.restore();
         c.publish();
         c
     }
@@ -197,8 +213,10 @@ impl Controller {
                 Err(RecvTimeoutError::Timeout) => {}
             }
             self.tick();
+            self.save_resume(false);
             self.publish();
         }
+        self.save_resume(true);
         // Stop audio before the sink goes away.
         self.player = None;
         self.sink = None;
@@ -316,6 +334,11 @@ impl Controller {
     }
 
     fn start_track(&mut self, index: usize) -> Result<(), String> {
+        self.load_track(index, false)
+    }
+
+    /// Loads the track at `index`; with `paused` it is ready but silent (no audible blip).
+    fn load_track(&mut self, index: usize, paused: bool) -> Result<(), String> {
         let path = self.playlist[index].clone();
         // Stop the old track first so they never overlap.
         self.player = None;
@@ -327,11 +350,18 @@ impl Controller {
         let player = Player::connect_new(sink.mixer());
         let amp = self.amplitude();
         player.set_volume(amp);
+        if paused {
+            player.pause();
+        }
         player.append(source);
 
         self.player = Some(player);
         self.index = Some(index);
-        self.status = Status::Playing;
+        self.status = if paused {
+            Status::Paused
+        } else {
+            Status::Playing
+        };
         self.track = Some(read_track_info(&path, decoder_duration));
         self.update_media_keys_metadata();
         Ok(())
@@ -437,11 +467,11 @@ impl Controller {
             return;
         }
         let Some(i) = self.index else { return };
-        match self.start_track(i) {
+        match self.load_track(i, true) {
             Ok(()) => {
                 self.seek(pos);
-                if was_paused {
-                    self.pause();
+                if !was_paused {
+                    self.play();
                 }
             }
             Err(e) => {
@@ -449,6 +479,64 @@ impl Controller {
                 self.error = Some(e);
             }
         }
+    }
+
+    /// Reopens the track that was loaded when the app was last closed, paused at
+    /// the saved position. The rest of its folder becomes the playlist.
+    fn restore(&mut self) {
+        let Some(state) = resume::load() else { return };
+        let Some(dir) = state.track.parent() else {
+            return;
+        };
+        let Ok(listing) = crate::library::list_dir(dir) else {
+            return;
+        };
+        self.playlist = listing.tracks.into_iter().map(|t| t.path).collect();
+        let Some(i) = self.playlist.iter().position(|p| *p == state.track) else {
+            self.playlist.clear();
+            return;
+        };
+        match self.load_track(i, true) {
+            Ok(()) => {
+                self.seek(state.position());
+                self.saved_resume = Some(state);
+            }
+            Err(e) => {
+                eprintln!(
+                    "simplemusicplayer: cannot restore {}: {e}",
+                    state.track.display()
+                );
+                self.halt();
+                self.playlist.clear();
+                self.index = None;
+                self.track = None;
+            }
+        }
+    }
+
+    /// Persists track + position whenever it changed meaningfully. While playing,
+    /// writes are throttled unless `force` is set.
+    fn save_resume(&mut self, force: bool) {
+        let current = match (&self.player, &self.track) {
+            (Some(_), Some(t)) if self.status != Status::Stopped => {
+                Some(ResumeState::new(t.path.clone(), self.position()))
+            }
+            _ => None,
+        };
+        if current == self.saved_resume {
+            return;
+        }
+        let same_track =
+            current.as_ref().map(|c| &c.track) == self.saved_resume.as_ref().map(|s| &s.track);
+        let throttled = self.status == Status::Playing
+            && same_track
+            && self.last_resume_save.elapsed() < RESUME_SAVE_INTERVAL;
+        if throttled && !force {
+            return;
+        }
+        resume::store(current.as_ref());
+        self.saved_resume = current;
+        self.last_resume_save = Instant::now();
     }
 
     fn update_media_keys_metadata(&mut self) {
@@ -637,5 +725,62 @@ mod tests {
         assert!((s.volume - 0.6).abs() < 1e-4);
         h.send(Command::ToggleMute);
         wait_for(&h, "muted", |s| s.muted);
+    }
+
+    /// Pause, quit, restart: the track must come back paused at the same position.
+    /// `SMP_TEST_LONG_DIR=dir cargo test -- --ignored resume_flow` (tracks of several seconds).
+    #[test]
+    #[ignore]
+    fn resume_flow() {
+        let dir = std::env::var("SMP_TEST_LONG_DIR").expect("SMP_TEST_LONG_DIR");
+        let state = std::env::temp_dir().join(format!("smp-resume-test-{}", std::process::id()));
+        // SAFETY: this test runs alone (ignored test, single-threaded setup before spawning).
+        unsafe { std::env::set_var("XDG_STATE_HOME", &state) };
+        let listing = crate::library::list_dir(Path::new(&dir)).unwrap();
+        let tracks: Vec<PathBuf> = listing.tracks.iter().map(|t| t.path.clone()).collect();
+        assert!(tracks.len() >= 2);
+        for idx in [0, 1] {
+            let mut h = PlayerHandle::spawn(egui::Context::default(), 0.5, true);
+            h.send(Command::PlayList {
+                tracks: tracks.clone(),
+                index: idx,
+            });
+            wait_for(&h, "position", |s| s.position > Duration::from_millis(1500));
+            h.send(Command::Pause);
+            let paused = wait_for(&h, "paused", |s| s.status == Status::Paused);
+            h.shutdown();
+
+            let h = PlayerHandle::spawn(egui::Context::default(), 0.5, true);
+            let s = wait_for(&h, "restored", |s| s.track.is_some());
+            println!(
+                "restored: {:?} at {:?} (was {:?})",
+                s.track.as_ref().map(|t| &t.path),
+                s.position,
+                paused.position
+            );
+            assert_eq!(s.status, Status::Paused);
+            assert_eq!(
+                s.track.as_ref().map(|t| t.path.clone()),
+                Some(tracks[idx].clone())
+            );
+            let diff = s.position.abs_diff(paused.position);
+            assert!(
+                diff < Duration::from_millis(300),
+                "position off by {diff:?}"
+            );
+            assert!(s.has_next == (idx + 1 < tracks.len()));
+            h.send(Command::TogglePause);
+            wait_for(&h, "playing again", |s| {
+                s.status == Status::Playing && s.position > paused.position
+            });
+            h.send(Command::Stop);
+            wait_for(&h, "stopped", |s| s.status == Status::Stopped);
+        }
+        // Stopped at exit: nothing to restore.
+        let h = PlayerHandle::spawn(egui::Context::default(), 0.5, true);
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(h.snapshot().track.is_none());
+        drop(h);
+        let _ = std::fs::remove_dir_all(&state);
     }
 }
