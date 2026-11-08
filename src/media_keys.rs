@@ -20,9 +20,12 @@ pub struct MediaKeys {
 
 impl MediaKeys {
     pub fn new(tx: Sender<Command>, ctx: egui::Context) -> Option<Self> {
+        // A per-process name (allowed by the MPRIS spec) so a second instance
+        // never takes over the bus name of a running one.
+        let dbus_name = format!("simplemusicplayer.instance{}", std::process::id());
         let config = PlatformConfig {
             display_name: "Simple Music Player",
-            dbus_name: "simplemusicplayer",
+            dbus_name: &dbus_name,
             hwnd: None,
         };
         let mut controls = match MediaControls::new(config) {

@@ -87,6 +87,11 @@ pub struct PlayerHandle {
 
 impl PlayerHandle {
     pub fn spawn(ctx: egui::Context, volume: f32, muted: bool) -> Self {
+        Self::spawn_with(ctx, volume, muted, true)
+    }
+
+    /// `media_keys: false` skips the MPRIS registration (used by tests).
+    fn spawn_with(ctx: egui::Context, volume: f32, muted: bool, media_keys: bool) -> Self {
         let (tx, rx) = mpsc::channel();
         let shared = Arc::new(Mutex::new(Snapshot {
             volume,
@@ -98,7 +103,7 @@ impl PlayerHandle {
         let thread = std::thread::Builder::new()
             .name("playback".into())
             .spawn(move || {
-                Controller::new(ctx, rx, thread_tx, thread_shared, volume, muted).run();
+                Controller::new(ctx, rx, thread_tx, thread_shared, volume, muted, media_keys).run();
             })
             .expect("failed to spawn playback thread");
         Self {
@@ -158,6 +163,9 @@ struct Controller {
 
     media_keys: Option<MediaKeys>,
     last_published: Snapshot,
+    /// Position while paused. A paused track holds no player and no audio device,
+    /// so the desktop does not show the app as playing sound.
+    paused_pos: Duration,
     /// Last state written to disk, and when.
     saved_resume: Option<ResumeState>,
     last_resume_save: Instant,
@@ -171,8 +179,13 @@ impl Controller {
         shared: Arc<Mutex<Snapshot>>,
         volume: f32,
         muted: bool,
+        with_media_keys: bool,
     ) -> Self {
-        let media_keys = MediaKeys::new(tx, ctx.clone());
+        let media_keys = if with_media_keys {
+            MediaKeys::new(tx, ctx.clone())
+        } else {
+            None
+        };
         let mut c = Self {
             ctx,
             rx,
@@ -189,6 +202,7 @@ impl Controller {
             error: None,
             media_keys,
             last_published: Snapshot::default(),
+            paused_pos: Duration::ZERO,
             saved_resume: None,
             last_resume_save: Instant::now(),
         };
@@ -370,12 +384,7 @@ impl Controller {
     fn play(&mut self) {
         match self.status {
             Status::Playing => {}
-            Status::Paused => {
-                if let Some(p) = &self.player {
-                    p.play();
-                    self.status = Status::Playing;
-                }
-            }
+            Status::Paused => self.resume_playback(),
             Status::Stopped => {
                 let i = self.index.unwrap_or(0);
                 if i < self.playlist.len() {
@@ -385,25 +394,54 @@ impl Controller {
         }
     }
 
+    /// Pauses and releases the audio device (the player is rebuilt on resume).
     fn pause(&mut self) {
-        if self.status == Status::Playing
-            && let Some(p) = &self.player
-        {
-            p.pause();
+        if self.status == Status::Playing && self.player.is_some() {
+            self.paused_pos = self.position();
+            self.release_audio();
             self.status = Status::Paused;
         }
     }
 
-    /// Stops playback but keeps the current track selected (Play restarts it).
-    fn stop(&mut self) {
-        self.player = None;
-        self.status = Status::Stopped;
+    /// Continues a paused track at `paused_pos` on a freshly opened device.
+    fn resume_playback(&mut self) {
+        let Some(i) = self.index.filter(|&i| i < self.playlist.len()) else {
+            return;
+        };
+        let pos = self.paused_pos;
+        match self.load_track(i, true) {
+            Ok(()) => {
+                if !pos.is_zero() {
+                    self.seek(pos);
+                }
+                if let Some(p) = &self.player {
+                    p.play();
+                }
+                self.status = Status::Playing;
+            }
+            Err(e) => {
+                eprintln!("simplemusicplayer: cannot resume: {e}");
+                self.halt();
+                self.error = Some(e);
+            }
+        }
     }
 
-    /// Stops after an error; the audio device is released so it can be reopened later.
+    fn release_audio(&mut self) {
+        self.player = None;
+        self.sink = None;
+    }
+
+    /// Stops playback but keeps the current track selected (Play restarts it).
+    fn stop(&mut self) {
+        self.release_audio();
+        self.status = Status::Stopped;
+        self.paused_pos = Duration::ZERO;
+    }
+
+    /// Stops after an error.
     fn halt(&mut self) {
         self.stop();
-        self.sink = None;
     }
 
     fn previous(&mut self) {
@@ -417,6 +455,18 @@ impl Controller {
     }
 
     fn seek(&mut self, pos: Duration) {
+        if self.status == Status::Paused && self.player.is_none() {
+            let max = self
+                .track
+                .as_ref()
+                .and_then(|t| t.duration)
+                .unwrap_or(Duration::MAX);
+            self.paused_pos = pos.min(max);
+            if let Some(mk) = &mut self.media_keys {
+                mk.set_status(self.status, self.paused_pos);
+            }
+            return;
+        }
         if let Some(p) = &self.player {
             if let Err(e) = p.try_seek(pos) {
                 self.error = Some(format!("Spulen nicht möglich: {e}"));
@@ -449,36 +499,25 @@ impl Controller {
     }
 
     fn position(&self) -> Duration {
-        self.player
-            .as_ref()
-            .map(|p| p.get_pos())
-            .unwrap_or_default()
+        match &self.player {
+            Some(p) => p.get_pos(),
+            None if self.status == Status::Paused => self.paused_pos,
+            None => Duration::ZERO,
+        }
     }
 
     /// The audio device vanished (e.g. sound server restart): reopen and resume.
     fn recover_device(&mut self) {
         eprintln!("simplemusicplayer: audio device lost, reopening");
-        let pos = self.position();
-        let was_paused = self.status == Status::Paused;
-        let had_track = self.player.is_some();
-        self.player = None;
-        self.sink = None;
-        if !had_track {
+        if self.status != Status::Playing {
+            // Nothing holds the device; it is reopened on the next Play.
+            self.release_audio();
             return;
         }
-        let Some(i) = self.index else { return };
-        match self.load_track(i, true) {
-            Ok(()) => {
-                self.seek(pos);
-                if !was_paused {
-                    self.play();
-                }
-            }
-            Err(e) => {
-                self.halt();
-                self.error = Some(e);
-            }
-        }
+        self.paused_pos = self.position();
+        self.release_audio();
+        self.status = Status::Paused;
+        self.resume_playback();
     }
 
     /// Reopens the track that was loaded when the app was last closed, paused at
@@ -496,34 +535,26 @@ impl Controller {
             self.playlist.clear();
             return;
         };
-        match self.load_track(i, true) {
-            Ok(()) => {
-                self.seek(state.position());
-                self.saved_resume = Some(state);
-            }
-            Err(e) => {
-                eprintln!(
-                    "simplemusicplayer: cannot restore {}: {e}",
-                    state.track.display()
-                );
-                self.halt();
-                self.playlist.clear();
-                self.index = None;
-                self.track = None;
-            }
-        }
+        // Paused without opening the audio device; Play loads the track.
+        self.index = Some(i);
+        self.track = Some(read_track_info(&state.track, None));
+        self.status = Status::Paused;
+        self.paused_pos = state.position();
+        self.update_media_keys_metadata();
+        self.saved_resume = Some(state);
     }
 
     /// Persists track + position whenever it changed meaningfully. While playing,
     /// writes are throttled unless `force` is set.
     fn save_resume(&mut self, force: bool) {
-        let current = match (&self.player, &self.track) {
-            (Some(_), Some(t)) if self.status != Status::Stopped => {
+        let current = match &self.track {
+            Some(t) if self.status != Status::Stopped => {
                 Some(ResumeState::new(t.path.clone(), self.position()))
             }
             _ => None,
         };
-        if current == self.saved_resume {
+        // `force` (on quit) always writes, in case the file was removed meanwhile.
+        if current == self.saved_resume && !(force && current.is_some()) {
             return;
         }
         let same_track =
@@ -647,6 +678,34 @@ mod tests {
         }
     }
 
+    /// A muted player without MPRIS, saving its state to a private temp dir
+    /// (never touches the user's resume file or a running instance).
+    fn test_player() -> PlayerHandle {
+        static INIT: std::sync::Once = std::sync::Once::new();
+        INIT.call_once(|| {
+            let dir = std::env::temp_dir().join(format!("smp-test-state-{}", std::process::id()));
+            // SAFETY: set once before any player thread of this test binary reads it.
+            unsafe { std::env::set_var("XDG_STATE_HOME", dir) };
+        });
+        PlayerHandle::spawn_with(egui::Context::default(), 0.5, true, false)
+    }
+
+    /// Number of PipeWire/Pulse streams of this process (None if `pactl` is missing).
+    fn own_audio_streams() -> Option<usize> {
+        let exe = std::env::current_exe().ok()?;
+        let needle = format!("[{}]\"", exe.file_name()?.to_string_lossy());
+        let out = std::process::Command::new("pactl")
+            .args(["list", "sink-inputs"])
+            .output()
+            .ok()?;
+        let text = String::from_utf8_lossy(&out.stdout);
+        Some(
+            text.lines()
+                .filter(|l| l.contains("application.name") && l.contains(&needle))
+                .count(),
+        )
+    }
+
     fn wait_for(h: &PlayerHandle, what: &str, f: impl Fn(&Snapshot) -> bool) -> Snapshot {
         let start = std::time::Instant::now();
         loop {
@@ -677,7 +736,7 @@ mod tests {
                 .map(|t| display_stem(&t.path))
                 .unwrap_or_default()
         };
-        let h = PlayerHandle::spawn(egui::Context::default(), 0.5, true);
+        let h = test_player();
 
         h.send(Command::PlayList {
             tracks: tracks.clone(),
@@ -733,24 +792,28 @@ mod tests {
     #[ignore]
     fn resume_flow() {
         let dir = std::env::var("SMP_TEST_LONG_DIR").expect("SMP_TEST_LONG_DIR");
-        let state = std::env::temp_dir().join(format!("smp-resume-test-{}", std::process::id()));
-        // SAFETY: this test runs alone (ignored test, single-threaded setup before spawning).
-        unsafe { std::env::set_var("XDG_STATE_HOME", &state) };
         let listing = crate::library::list_dir(Path::new(&dir)).unwrap();
         let tracks: Vec<PathBuf> = listing.tracks.iter().map(|t| t.path.clone()).collect();
         assert!(tracks.len() >= 2);
         for idx in [0, 1] {
-            let mut h = PlayerHandle::spawn(egui::Context::default(), 0.5, true);
+            let mut h = test_player();
             h.send(Command::PlayList {
                 tracks: tracks.clone(),
                 index: idx,
             });
             wait_for(&h, "position", |s| s.position > Duration::from_millis(1500));
+            assert_eq!(own_audio_streams(), Some(1), "one stream while playing");
             h.send(Command::Pause);
             let paused = wait_for(&h, "paused", |s| s.status == Status::Paused);
+            std::thread::sleep(Duration::from_millis(500));
+            assert_eq!(
+                own_audio_streams(),
+                Some(0),
+                "pause must release the audio device"
+            );
             h.shutdown();
 
-            let h = PlayerHandle::spawn(egui::Context::default(), 0.5, true);
+            let h = test_player();
             let s = wait_for(&h, "restored", |s| s.track.is_some());
             println!(
                 "restored: {:?} at {:?} (was {:?})",
@@ -777,10 +840,9 @@ mod tests {
             wait_for(&h, "stopped", |s| s.status == Status::Stopped);
         }
         // Stopped at exit: nothing to restore.
-        let h = PlayerHandle::spawn(egui::Context::default(), 0.5, true);
+        let h = test_player();
         std::thread::sleep(Duration::from_millis(500));
         assert!(h.snapshot().track.is_none());
         drop(h);
-        let _ = std::fs::remove_dir_all(&state);
     }
 }
